@@ -1,0 +1,283 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AgentStatus {
+  draft // saved locally, not yet pushed to Bolna
+  active // synced, phone number live
+  paused // synced but taking no calls
+  failed // last sync to Bolna errored — check lastSyncError
+}
+
+enum VoiceProfile {
+  male
+  female
+  multilingual
+}
+
+enum VoiceEngine {
+  mock
+  vapi
+  bolna
+}
+
+enum LeadSource {
+  meta
+  google
+  website
+  referral
+  manual
+}
+
+enum LeadStatus {
+  new
+  calling
+  qualified
+  site_visit
+  follow_up
+  closed
+  lost
+}
+
+enum AppointmentStatus {
+  proposed
+  booked
+  completed
+  cancelled
+  no_show
+}
+
+enum FollowUpStatus {
+  draft
+  queued
+  sent
+  failed
+}
+
+enum UserRole {
+  owner
+  admin
+  member
+}
+
+enum SubscriptionStatus {
+  trial
+  active
+  past_due
+  cancelled
+  disabled
+}
+
+model Workspace {
+  id                       String             @id @default(uuid())
+  name                     String
+  slug                     String             @unique
+  country                  String             @default("IN")
+  vertical                 String             @default("real-estate")
+  publicAppUrl             String?
+  verifiedCallingNumber    String?
+  bolnaWebhookUrl          String?
+  recordingConsentRequired Boolean            @default(true)
+  consentDisclaimer        String             @default("This call may be recorded and handled by an AI assistant for lead qualification and service quality.")
+  retentionDays            Int                @default(180)
+  status                   String             @default("pilot")
+  createdAt                DateTime           @default(now())
+  updatedAt                DateTime           @updatedAt
+
+  users                    AppUser[]
+  agents                   VoiceAgent[]
+  subscriptions            Subscription[]
+  auditEvents              AuditEvent[]
+
+  @@index([status])
+}
+
+model AppUser {
+  id           String     @id @default(uuid())
+  workspaceId  String
+  workspace    Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email        String     @unique
+  name         String
+  passwordHash String
+  role         UserRole   @default(owner)
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([workspaceId])
+}
+
+model Subscription {
+  id                   String             @id @default(uuid())
+  workspaceId          String
+  workspace            Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  status               SubscriptionStatus @default(trial)
+  planName             String             @default("Pilot")
+  monthlyPricePaise    Int                @default(999900)
+  includedMinutes      Int                @default(250)
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  currentPeriodEnd     DateTime?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  @@index([workspaceId])
+  @@index([status])
+}
+
+model AuditEvent {
+  id          String    @id @default(uuid())
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  level       String    @default("info")
+  source      String
+  message     String    @db.Text
+  metadata    Json?
+  createdAt   DateTime  @default(now())
+
+  @@index([workspaceId])
+  @@index([level])
+  @@index([createdAt])
+}
+
+model VoiceAgent {
+  id             String       @id @default(uuid())
+  workspaceId    String
+  workspace      Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  companyName    String
+  businessPrompt String       @db.Text
+  businessContext Json?
+  // Postgres text[] — e.g. ["en","es","hi","te"]. Kept as ISO-ish short
+  // codes so Bolna / Deepgram language params can be passed through as-is.
+  languages      String[]
+  voiceProfile   VoiceProfile @default(multilingual)
+  phoneNumber    String?      @unique // assigned Twilio/Plivo number, once provisioned
+  defaultEngine  VoiceEngine  @default(mock)
+
+  // Provider-side identifiers, populated after successful sync.
+  bolnaAgentId   String?      @unique
+  vapiAssistantId String?     @unique
+  status         AgentStatus  @default(draft)
+  lastSyncError  String?      @db.Text
+  lastSyncedAt   DateTime?
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  calls          CallLog[]
+  leads          Lead[]
+  appointments   Appointment[]
+  followUps      FollowUp[]
+
+  @@index([status])
+  @@index([workspaceId])
+}
+
+model CallLog {
+  id               String    @id @default(uuid())
+  agentId          String
+  agent            VoiceAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  leadId           String?
+  lead             Lead?      @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  callerNumber     String?
+  detectedLanguage String?
+  // Array of {role, text, timestampMs} turns — kept schemaless since
+  // transcript shape depends on what Bolna's webhook payload sends.
+  transcript       Json?
+  durationSec      Int?
+  status           String    @default("in_progress") // in_progress | completed | missed | failed
+  engine           VoiceEngine @default(mock)
+  externalCallId   String?
+  summary          String?   @db.Text
+  outcome          String?
+  recordingUrl     String?
+
+  startedAt        DateTime  @default(now())
+  endedAt          DateTime?
+
+  @@index([agentId])
+  @@index([leadId])
+  @@index([engine])
+  @@index([externalCallId])
+  @@index([startedAt])
+}
+
+model Lead {
+  id              String       @id @default(uuid())
+  agentId         String
+  agent           VoiceAgent   @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  name            String
+  phone           String
+  source          LeadSource   @default(manual)
+  status          LeadStatus   @default(new)
+  budgetMinLakh   Int?
+  budgetMaxLakh   Int?
+  location        String?
+  timeline        String?
+  propertyType    String?
+  notes           String?      @db.Text
+  intentScore     Int          @default(50)
+  preferredLanguage String     @default("te")
+  nextAction      String       @default("Call now")
+
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  calls           CallLog[]
+  appointments    Appointment[]
+  followUps       FollowUp[]
+
+  @@index([agentId])
+  @@index([status])
+  @@index([intentScore])
+  @@index([createdAt])
+}
+
+model Appointment {
+  id              String             @id @default(uuid())
+  agentId         String
+  agent           VoiceAgent         @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  leadId          String
+  lead            Lead               @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  scheduledFor    DateTime
+  status          AppointmentStatus  @default(booked)
+  purpose         String             @default("Site visit")
+  location        String?
+  notes           String?            @db.Text
+
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  @@index([agentId])
+  @@index([leadId])
+  @@index([scheduledFor])
+}
+
+model FollowUp {
+  id              String           @id @default(uuid())
+  agentId         String
+  agent           VoiceAgent       @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  leadId          String
+  lead            Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  channel         String           @default("whatsapp")
+  message         String           @db.Text
+  status          FollowUpStatus   @default(draft)
+  scheduledFor    DateTime?
+  sentAt          DateTime?
+
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([agentId])
+  @@index([leadId])
+  @@index([status])
+}

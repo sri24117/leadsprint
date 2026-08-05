@@ -1,0 +1,13 @@
+.next
+node_modules
+npm-debug.log
+.env
+.env.local
+.env.production
+.git
+.gitignore
+README.md
+MVP_POSITIONING.md
+PRODUCTION_SETUP.md
+LAUNCH_CHECKLIST.md
+audit-artifacts
