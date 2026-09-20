@@ -26,7 +26,7 @@ export const createAgentSchema = z.object({
     .min(1, "Select at least one language")
     .max(SUPPORTED_LANGUAGES.length),
   voiceProfile: z.enum(["male", "female", "multilingual"]).default("multilingual"),
-  defaultEngine: z.enum(["mock", "vapi", "bolna"]).default("mock")
+  defaultEngine: z.enum(["mock", "vapi", "bolna", "retell"]).default("mock")
 });
 
 export const updateAgentSchema = createAgentSchema.partial().extend({
@@ -78,7 +78,7 @@ export const createFollowUpSchema = z.object({
 export const callSummarySchema = z.object({
   agentId: z.string().uuid().optional(),
   leadId: z.string().uuid().optional(),
-  engine: z.enum(["mock", "vapi", "bolna"]).default("mock"),
+  engine: z.enum(["mock", "vapi", "bolna", "retell"]).default("mock"),
   externalCallId: z.string().max(160).optional(),
   callerNumber: z.string().max(24).optional(),
   transcript: z
@@ -101,9 +101,10 @@ export const startCallSchema = z.object({
   leadId: z.string().uuid(),
   agentId: z.string().uuid().optional(),
   phone: z.string().optional(),
-  engine: z.enum(["mock", "vapi", "bolna"]).optional(),
-  fallbackEngine: z.enum(["mock", "vapi", "bolna"]).optional(),
-  reason: z.string().max(240).optional()
+  engine: z.enum(["mock", "vapi", "bolna", "retell"]).optional(),
+  fallbackEngine: z.enum(["mock", "vapi", "bolna", "retell"]).optional(),
+  reason: z.string().max(240).optional(),
+  idempotencyKey: z.string().min(8).max(120).optional()
 });
 
 export const updateWorkspaceSchema = z.object({
