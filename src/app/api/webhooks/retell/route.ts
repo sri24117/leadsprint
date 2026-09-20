@@ -19,7 +19,7 @@ function authorized(req: NextRequest) {
   const secret = process.env.RETELL_WEBHOOK_SECRET;
   if (!secret) return process.env.NODE_ENV !== "production";
   const incoming = req.headers.get("x-retell-secret") ?? req.headers.get("authorization")?.replace(/^Bearer /, "");
-  return validateSharedSecret(secret, incoming);
+  return validateSharedSecret(secret, incoming ?? null);
 }
 
 export async function POST(req: NextRequest) {
@@ -33,7 +33,7 @@ export async function POST(req: NextRequest) {
   const eventType = payload.event ?? "call_update";
   const eventId = payload.event_id ?? call.call_id + ":" + eventType + ":" + (call.end_timestamp ?? call.start_timestamp ?? "unknown");
   try {
-    await prisma.providerEvent.create({ data: { workspaceId: agent.workspaceId, provider: "retell", externalEventId: eventId, eventType, payload } });
+    await prisma.providerEvent.create({ data: { workspaceId: agent.workspaceId, provider: "retell", externalEventId: eventId, eventType, payload: payload as any } });
   } catch (error) {
     if ((error as { code?: string }).code === "P2002") return NextResponse.json({ ok: true, duplicate: true });
     throw error;
