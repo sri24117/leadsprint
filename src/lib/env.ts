@@ -21,6 +21,7 @@ function publicHttpsAppUrl() {
 export function getRuntimeChecks(): RuntimeCheck[] {
   const defaultEngine = process.env.DEFAULT_VOICE_ENGINE ?? "mock";
   const wantsVapi = defaultEngine === "vapi";
+  const wantsRetell = defaultEngine === "retell";
   const wantsBolna = defaultEngine === "bolna";
 
   return [
@@ -47,6 +48,18 @@ export function getRuntimeChecks(): RuntimeCheck[] {
       ok: present("VAPI_WEBHOOK_SECRET"),
       required: wantsVapi,
       message: "Set VAPI_WEBHOOK_SECRET before exposing the webhook publicly"
+    },
+    {
+      name: "Retell outbound",
+      ok: present("RETELL_API_KEY") && present("RETELL_AGENT_ID") && present("RETELL_FROM_NUMBER"),
+      required: wantsRetell,
+      message: "Requires RETELL_API_KEY, RETELL_AGENT_ID, and RETELL_FROM_NUMBER"
+    },
+    {
+      name: "Retell webhook",
+      ok: present("RETELL_WEBHOOK_SECRET"),
+      required: wantsRetell,
+      message: "Set RETELL_WEBHOOK_SECRET before exposing Retell callbacks"
     },
     {
       name: "Bolna outbound",
