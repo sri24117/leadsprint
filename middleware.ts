@@ -11,6 +11,7 @@ const publicPaths = [
   "/api/readiness",
   "/api/webhooks/bolna",
   "/api/webhooks/vapi",
+  "/api/webhooks/retell",
   "/api/webhooks/twilio/voice",
   "/api/webhooks/stripe",
   "/api/cron/retention"
