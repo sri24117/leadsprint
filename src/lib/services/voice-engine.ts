@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 
-export type VoiceEngineName = "mock" | "vapi" | "bolna";
+export type VoiceEngineName = "mock" | "vapi" | "bolna" | "retell";
 
 export type VoiceCallRequest = {
   leadId: string;
@@ -41,6 +41,29 @@ class MockVoiceEngine implements VoiceEngine {
   }
 }
 
+class RetellVoiceEngine implements VoiceEngine {
+  name: VoiceEngineName = "retell";
+  async startLeadCall(request: VoiceCallRequest): Promise<VoiceCallResult> {
+    const apiKey = process.env.RETELL_API_KEY;
+    const fromNumber = process.env.RETELL_FROM_NUMBER;
+    const agentId = process.env.RETELL_AGENT_ID;
+    if (!apiKey || !fromNumber || !agentId) throw new Error("RETELL_API_KEY, RETELL_FROM_NUMBER, and RETELL_AGENT_ID are required");
+    const res = await fetch("https://api.retellai.com/v2/create-phone-call", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from_number: fromNumber,
+        to_number: request.leadPhone,
+        override_agent_id: agentId,
+        metadata: { leadId: request.leadId, agentId: request.agentId, product: "LeadSprint" },
+        retell_llm_dynamic_variables: { lead_name: request.leadName, company_name: request.companyName, preferred_language: request.preferredLanguage, qualification_context: request.businessPrompt }
+      })
+    });
+    if (!res.ok) throw new Error("Retell call failed: " + res.status + " " + await res.text());
+    const data = await res.json();
+    return { engine: this.name, externalCallId: data.call_id ?? "retell-" + randomUUID(), status: "queued", providerMessage: "Retell outbound call queued", costHintPerMin: "Retell voice + telephony usage" };
+  }
+}
 class VapiVoiceEngine implements VoiceEngine {
   name: VoiceEngineName = "vapi";
 
@@ -145,13 +168,14 @@ class BolnaVoiceEngine implements VoiceEngine {
 }
 
 function engineByName(name: VoiceEngineName): VoiceEngine {
+  if (name === "retell") return new RetellVoiceEngine();
   if (name === "vapi") return new VapiVoiceEngine();
   if (name === "bolna") return new BolnaVoiceEngine();
   return new MockVoiceEngine();
 }
 
 export function normalizeEngine(value?: string | null): VoiceEngineName | undefined {
-  if (value === "mock" || value === "vapi" || value === "bolna") return value;
+  if (value === "mock" || value === "vapi" || value === "bolna" || value === "retell") return value;
   return undefined;
 }
 
@@ -166,7 +190,7 @@ export function chooseEngine(input: {
   if (input.defaultEngine && input.defaultEngine !== "mock") return input.defaultEngine;
   if (envDefault && envDefault !== "mock") return envDefault;
   if ((input.leadVolumeHint ?? 0) > 1000) return "bolna";
-  if (input.preferredLanguage === "te" || input.preferredLanguage === "hi") return "vapi";
+  if (input.preferredLanguage === "te" || input.preferredLanguage === "hi") return "retell";
   return "mock";
 }
 
@@ -178,8 +202,8 @@ export async function startLeadCallWithFallback(
   try {
     return await primary.startLeadCall(request);
   } catch (error) {
-    const fallbackName = options.fallbackEngine ?? "mock";
-    if (fallbackName === primary.name) throw error;
+    const fallbackName = options.fallbackEngine;
+    if (!fallbackName || fallbackName === primary.name || (process.env.NODE_ENV === "production" && fallbackName === "mock")) throw error;
     const fallback = engineByName(fallbackName);
     const result = await fallback.startLeadCall({ ...request, engine: fallbackName });
     return {
