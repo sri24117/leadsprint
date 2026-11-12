@@ -1,179 +1,186 @@
-# LeadSprint - Real Estate AI Caller
+# LeadSprint
 
-Market-ready MVP for a real estate AI lead caller.
+AI speed-to-lead for small sales teams: the moment an enquiry arrives, an AI voice
+agent calls it back, qualifies it, and books a Cal.com appointment or transfers to a
+human — inside consent and quiet-hours limits, with an operator console. (Outbound
+follow-up only; inbound call answering is not yet supported.) See `docs/leadsprint-provider-setup.md` for the product
+architecture and `Coolify + Git + Collaboration Deploy Sheet` for the
+infra/collaboration workflow this repo is meant to be deployed with.
 
-> **Current maturity:** production-shaped prototype. Several screens and provider
-> paths are still demo/partial, and the repository must pass the gates in the
-> [market-readiness audit](MARKET_READINESS_AUDIT.md) before real customer data or
-> paid calling traffic is enabled.
+## Stack
 
-Positioning:
+pnpm monorepo · Express 5 API (`artifacts/api-server`) · React/Vite operator
+console (`artifacts/leadsprint`) · PostgreSQL via Drizzle ORM (`lib/db`) ·
+Clerk auth · OpenAPI-first contract with codegen (`lib/api-spec`,
+`lib/api-zod`, `lib/api-client-react`).
 
-> LeadSprint calls every new real estate lead within 10 seconds, qualifies budget/location/timeline in Telugu/Hindi/English, books site visits, and sends WhatsApp summaries to the sales team.
+## Industries (verticals)
 
-## Product and Engineering Playbook
+Each workspace runs an industry **profile** (`artifacts/api-server/src/lib/verticals`):
+the lead fields, urgency levels, appointment wording, qualification defaults and
+voice script that differ between industries. The engine (intake, consent, call queue,
+safety gate, booking) never branches on an industry; it reads the profile.
 
-The authoritative pilot blueprint is in [`docs/00_INDEX.md`](docs/00_INDEX.md).
-It covers product strategy, architecture, database/API design, UI/UX, backend and
-frontend implementation, deployment, QA/security, go-to-market, decisions, and
-operational runbooks.
+| Vertical | Status | Docs |
+|---|---|---|
+| `real_estate` | Original behaviour, the default | `docs/retell-agent.md`, `docs/sales-demo.md` |
+| `home_services` (AC repair & plumbing) | Outbound callback to Meta and web leads, emergency alerts, service-area check | `docs/meta-lead-ads.md`, `docs/retell-agent-home-services.md`, `docs/sales-demo-home-services.md` |
 
-The pilot is intentionally narrowed to one golden path:
+Design: `docs/superpowers/specs/2026-10-26-home-services-vertical-meta-leads-design.md`.
 
-```text
-Meta lead -> policy gate -> queued Bolna call -> verified result
--> qualification -> sales handoff -> WhatsApp -> site visit
-```
+## Demo (one command)
 
-Target pilot navigation: Today, Leads, Calls, Handoff, and Connections. Unfinished
-modules should be hidden instead of presenting simulated data as real operations.
-
-## What This Build Includes
-
-- Premium dashboard UI for a real estate sales team.
-- Lead pipeline with hot leads, qualification status, budget, location, timeline, and next action.
-- Selected lead detail panel with intent score and WhatsApp summary action.
-- Call transcript/timeline UI with call duration.
-- Agent setup panel for qualification focus.
-- Hybrid voice engine selector: mock, Vapi, Bolna, or auto routing.
-- APIs for dashboard, leads, appointments, follow-ups, and call summaries.
-- Call-start API plus Twilio inbound, Bolna, and Vapi webhook routes.
-- Prisma/Postgres data model for agents, calls, leads, appointments, and follow-ups.
-- Demo-safe sample data fallback when the DB or providers are not configured.
-- Production migration, seed script, readiness checks, Docker setup, and launch checklist.
-
-## Local Dev
+The fastest way to see the product — no Docker, no cloud accounts, no real
+phone calls:
 
 ```bash
-cp .env.example .env
-npm install
-npm run prisma:generate
-npm run dev
+pnpm demo            # fresh-ish boot, reuses the existing demo database
+pnpm demo --reset    # boot with a fresh, re-seeded demo database
+pnpm demo --vertical home_services   # the AC & plumbing demo (implies --reset)
 ```
 
-Open:
+Boots embedded PostgreSQL, pushes the schema, starts Retell/Cal.com provider
+stubs, builds everything, and serves the seeded operator console on
+`http://localhost:5000/`. `Ctrl+C` stops all of it. Ports are overridable via
+`DEMO_PORT`, `DEV_PG_PORT`, `STUB_PORT`.
 
-```text
-http://localhost:3000
-```
+For the scripted 10-minute sales walkthrough (the exact webhook commands,
+talking points, and live-phone-call setup), see
+[`docs/sales-demo.md`](docs/sales-demo.md).
 
-The UI works in demo mode even before Postgres is running.
-
-## Full Local Stack
+## Local development
 
 ```bash
-docker compose up -d postgres
-npm run prisma:migrate
-npm run dev
+corepack enable
+pnpm install
+pnpm --filter @workspace/db run migrate     # apply lib/db/drizzle migrations
+pnpm --filter @workspace/api-server run dev  # API on the port you set
+pnpm --filter @workspace/leadsprint run dev  # frontend Vite dev server (port 5173; proxies /api to 127.0.0.1:5000)
 ```
 
-## Core API
+Requires `DATABASE_URL` at minimum. Missing Clerk credentials leave the
+operator API locked; missing Retell or Cal.com credentials block live calling
+and booking. Check `GET /api/readyz` for database and provider configuration.
+`PORT` and `BASE_PATH` have
+local defaults (`5173`, `/`); CI and the Dockerfile set them explicitly.
 
-```text
-GET  /api/dashboard
-GET  /api/leads
-POST /api/leads
-PATCH /api/leads/:id
-POST /api/appointments
-POST /api/follow-ups
-POST /api/call-summary
-POST /api/calls/start
-POST /api/webhooks/twilio/voice
-POST /api/webhooks/bolna
-POST /api/webhooks/vapi
-GET  /api/health
-GET  /api/readiness
-POST /api/cron/retention
-```
+### Running the console without Clerk (local only)
 
-## Testing
+The operator console is Clerk-gated, so with no Clerk instance the UI can't get
+past sign-in. For local work there's an explicitly gated bypass that runs the
+console against the seeded demo business with **no authentication at all**:
 
 ```bash
-npm test          # run once (30 tests: auth crypto, webhook signatures, scoring, rate limiter)
-npm run test:watch
+# API server (runtime)
+LEADSPRINT_DEMO_AUTH=true NODE_ENV=development
+# frontend (build/dev time — this is what removes the Clerk provider)
+VITE_LEADSPRINT_DEMO_AUTH=true
 ```
 
-CI (`.github/workflows/ci.yml`) runs typecheck + tests + build on every push/PR.
+It is refused when `NODE_ENV=production` (logged as an error and ignored),
+logs a `WARN` at boot, surfaces as `"auth": "demo"` on `GET /api/readyz`, and
+paints a permanent banner across the console. Never set it on a deployment
+anyone else can reach.
 
-## Data Retention
+## Production deploy (Docker / Coolify)
 
-`Workspace.retentionDays` (default 180) drives automatic redaction of call transcripts, recording URLs, and caller numbers on `CallLog` rows older than that window — records aren't deleted outright, just stripped of PII, so call-volume analytics stay intact.
+This repo builds to a single container that serves both the API and the
+built frontend on one port — the shape Coolify's "Git Repository" resource
+expects.
 
-- **Docker/VPS deploy**: add a real crontab entry — `0 3 * * * cd /path/to/app && npm run retention:run`
-- **Serverless deploy (Vercel etc.)**: use `POST /api/cron/retention` with header `X-Cron-Secret: <CRON_SECRET>`. See `.github/workflows/retention-cron.yml` for a GitHub Actions-based scheduler if your host has no native cron.
+After deploying, run `pnpm pilot:preflight https://your-domain` from a
+separate machine. It checks trusted HTTPS, database, Clerk mode, required
+pilot providers, anonymous API rejection, and the console route. It cannot
+replace a controlled real Retell call and Cal.com booking; see
+[`docs/paid-pilot-launch.md`](docs/paid-pilot-launch.md).
 
-## Hybrid Voice Strategy
+```bash
+docker build -t leadsprint .
+docker run -p 5000:5000 --env-file .env leadsprint
+```
 
-Use all three paths instead of betting the company on one provider:
+On Coolify: **Add Resource → Git Repository (with GitHub App) → Dockerfile**
+build method, point at this repo's `main` branch, set the application port
+to `5000` (or whatever `PORT` you configure), and add the environment
+variables from `.env.example` in the Coolify UI. Full walkthrough in the
+deploy sheet PDF. The exact settings, a post-deploy checklist and a troubleshooting
+table built from real failed deploys are in [`docs/coolify-deploy.md`](docs/coolify-deploy.md).
 
-- `mock`: local demos, sales calls, UI testing, and fallback when provider keys are missing.
-- `vapi`: fastest premium pilot path for the first 1-5 customers.
-- `bolna`: self-hosted/control path once call volume is high enough to justify infra work.
+### Database
 
-Recommended route:
+The API applies its own migrations (`lib/db/drizzle`) on boot, so a normal
+deploy needs no separate step. To pre-provision from a machine that can
+reach the database — or as a Coolify one-off command — run the same
+migrator explicitly:
 
-1. Sell with mock dashboard demos this week.
-2. Run the first paid pilot with Vapi because setup is fastest.
-3. Add Bolna for high-volume India customers who need lower variable cost or infra control.
-4. Keep both engines behind `/api/calls/start` so the product experience stays the same.
+```bash
+pnpm --filter @workspace/db run migrate
+```
 
-## First Customer Demo
+Do **not** use `drizzle-kit push` on a deployed database. `push` bypasses
+Drizzle's migration journal, so the app's boot migrator sees a
+migration-naive database, tries to replay `0000`, fails, and every later
+migration is silently blocked from ever applying. `migrate` and the
+migrator the app runs on boot share the same journal and are safe to run
+in any order or repeatedly.
 
-1. Open the dashboard.
-2. Show the empty/new lead workflow.
-3. Add a lead named "Pradeep Sharma" with budget and location.
-4. Select the lead and show intent score + next action.
-5. Choose Mock, Vapi, Bolna, or Auto in Agent setup.
-6. Click Call now to queue a lead call.
-7. Click WhatsApp summary.
-8. Explain that in production this action sends a real WhatsApp message after the call.
-9. Show the transcript panel as the sales review screen.
+Already have a database that was created with `push`? Start the app once
+and it adopts it — it verifies every expected table is present, records the
+existing migrations as applied, and logs:
 
-Demo pitch:
+```
+[db] This database already had the schema but no migration history
+     (provisioned outside the migrator, e.g. `drizzle-kit push`).
+     Recorded 1 existing migration(s) as applied so future migrations can run.
+```
 
-> You already pay Meta and Google for leads. The problem is speed-to-lead. LeadSprint calls every lead instantly in Telugu/Hindi/English, qualifies budget and location, books site visits, and sends your sales team a WhatsApp summary.
+(`pnpm --filter @workspace/db run migrate` will still fail on such a
+database with `relation "activities" already exists` — it is the raw
+Drizzle CLI, with no adoption step. The app is the thing that adopts it.)
 
-## Production Wiring
+### Scheduled jobs
 
-For full production setup, use [PRODUCTION_SETUP.md](./PRODUCTION_SETUP.md) and [LAUNCH_CHECKLIST.md](./LAUNCH_CHECKLIST.md).
+Four endpoints are meant to run on a schedule (Coolify → Scheduled Tasks,
+or any cron), authenticated with the `CRON_SECRET` env var via the
+`x-cron-secret` header — not a Clerk session:
 
-### Required Accounts
+| Endpoint | Suggested schedule | What it does |
+|---|---|---|
+| `POST /api/cron/process-jobs` | every 5–10 min | Retries calls that were queued while Retell wasn't configured, or blocked by quiet hours — a quiet-hours retry is scheduled for the opening of the next allowed calling window, so an enquiry that arrives overnight is called in the morning. Each job is claimed atomically, so this endpoint and `ENABLE_INTERNAL_WORKER` can run side by side without dialing twice. The safety policy is re-checked on every attempt. |
+| `POST /api/cron/weekly-report` | weekly | Emails each business owner their weekly numbers (no-ops per business if SMTP isn't configured). |
+| `POST /api/cron/health-alerts` | every 15 min | Emails `ALERT_EMAIL` when a workspace has failed/uncertain calls piling up (`ALERT_FAILED_CALLS_THRESHOLD`, default 3 in 24h) or a job queue nothing is draining. Always answers 200 with the findings; `notified` says whether a human was emailed. |
+| `POST /api/cron/retention` | daily | Prunes raw provider-event payloads and stale activity rows past `RETENTION_DAYS`. Never touches leads, calls, contacts, or appointments. |
 
-- Twilio or Exotel/Plivo for telephony.
-- Vapi for managed calls and/or Bolna self-hosted for controlled high-volume calls.
-- Deepgram or OpenAI realtime transcription.
-- OpenAI/OpenRouter for the LLM.
-- Cartesia/ElevenLabs/Deepgram for TTS.
-- WhatsApp Business API provider.
+```bash
+curl -X POST https://your-domain/api/cron/process-jobs \
+  -H "x-cron-secret: $CRON_SECRET"
+```
 
-### Security Before Public Launch
+### Health checks
 
-- [x] Twilio signature verification — implemented (`src/lib/auth-crypto.ts::validateTwilioSignature`), enforced once `TWILIO_AUTH_TOKEN` is set.
-- [x] Bolna webhook verification — shared secret via `BOLNA_WEBHOOK_SECRET` + `X-Webhook-Secret` header.
-- [x] Authentication and tenant isolation — session auth + `workspaceId` scoping on every query.
-- [x] Rate limiting — per-IP/per-email on login, general limiter on all public/unauthenticated routes, plus nginx `limit_req` at the edge.
-- [x] Call recording consent copy — `Workspace.consentDisclaimer`, injected into the agent prompt when `recordingConsentRequired` is true.
-- [x] DPDP-style data retention — `scripts/retention-cleanup.mjs` (cron) or `POST /api/cron/retention` (serverless), redacts transcripts/recordings/caller numbers past `retentionDays`.
-- [ ] Confirm final Vapi and Bolna webhook payloads against live provider docs/accounts once you have real credentials — the current shapes are best-guesses documented in the webhook route comments.
-- [ ] Put Postgres behind private network only — done for Docker (`127.0.0.1`-only binding); if you deploy Postgres elsewhere (managed/Supabase), confirm it's not publicly reachable there too.
-- [ ] Enable HTTPS on nginx — config is ready in `nginx/nginx.conf`, commented out pending your domain + certbot run.
+- `GET /api/healthz` — liveness, no dependencies.
+- `GET /api/readyz` — reports demo vs. live mode per provider, plus which auth
+  mode is active (`clerk` / `demo` / `unconfigured`). Both work without Clerk
+  configured; only the operator-console routes under `requireAuth` need a
+  Clerk session, and they answer 401 (not 500) when Clerk is unset.
 
-## Pricing Recommendation
+### Behind a reverse proxy
 
-India real estate pilot:
+Set `TRUST_PROXY` to the number of proxy hops in front of the app (default
+`1`, which matches Coolify/Traefik). It has to be right: `req.protocol` and
+`req.ip` feed the Twilio webhook signature check, which is computed over the
+public `https://` URL. Use `TRUST_PROXY=false` when the app is exposed
+directly.
 
-- Setup: Rs 25,000 to Rs 75,000
-- Monthly: Rs 15,000 to Rs 50,000
-- Usage: included minutes plus Rs 5 to Rs 12/min overage
+## Safety policy
 
-Pilot offer:
+Every outbound call goes through `artifacts/api-server/src/lib/policy.ts`
+before any provider request is made: consent → suppression → quiet hours →
+attempt limit → `LEADSPRINT_KILL_SWITCH`. Blocked attempts are recorded as
+`policy_blocked` calls with a reason, visible in the operator console.
 
-> 7-day pilot on 50-100 leads. We measure contacted leads, qualified leads, site visits booked, and sales handoffs.
+## CI
 
-## Next Engineering Steps
-
-1. Add real provider credentials and place an end-to-end Vapi pilot call.
-2. Add auth and organization tenancy.
-3. Add WhatsApp Cloud API integration.
-4. Add Bolna webhook signature verification once the exact provider header is known.
-5. Add deployment pipeline and demo video.
+`.github/workflows/ci.yml` runs `pnpm run typecheck` and builds both the
+API server and the frontend on every push/PR to `main` — this is the check
+that would have caught a build-breaking bug before it reached main.

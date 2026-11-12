@@ -1,0 +1,274 @@
+# Pilot acceptance — end-to-end verification
+
+Unit tests and typechecks do not prove the product works. During Day 7–8
+verification the entire operator-console API was returning
+`401 Invalid Retell signature` for every request while the full test suite
+passed, because a webhook signature middleware was mounted unscoped. Static
+checks cannot catch that class of failure.
+
+This document is the runbook for booting the real stack and verifying the
+critical path against a real Postgres wire connection and real HTTP requests,
+before any pilot customer is onboarded.
+
+## 1. Boot the stack
+
+Four terminals (or the Arena process tools).
+
+```bash
+# 1. Local Postgres (embedded PGlite behind a real TCP wire socket, no Docker)
+pnpm --filter @workspace/scripts run dev-postgres
+# -> postgres://postgres:postgres@127.0.0.1:5433/postgres
+
+# 2. Apply the schema (the API also does this on boot; the app owns its
+#    migrations. Never `drizzle-kit push` a deployed database — it bypasses
+#    the journal and blocks every future migration.)
+DATABASE_URL="postgres://postgres:postgres@127.0.0.1:5433/postgres" \
+  pnpm --filter @workspace/db run migrate
+
+# 3. Provider stub, stands in for Retell + Cal.com so nothing dials a real phone
+node scripts/src/provider-stub.mjs
+
+# 4. Build, then run the API with the SPA attached
+PORT=5000 BASE_PATH=/ pnpm --filter @workspace/leadsprint run build
+pnpm --filter @workspace/api-server run build
+
+DATABASE_URL="postgres://postgres:postgres@127.0.0.1:5433/postgres" \
+DATABASE_POOL_MAX=1 \
+LEADSPRINT_DEMO_AUTH=true LEADSPRINT_DEMO_SEED=true \
+LEAD_INTAKE_WEBHOOK_SECRET=devsecret CRON_SECRET=devcron \
+RETELL_API_URL=http://127.0.0.1:5510/retell RETELL_API_KEY=stub_key \
+RETELL_AGENT_ID=agent_stub RETELL_FROM_NUMBER_US=+12125550100 \
+RETELL_WEBHOOK_SECRET=retellsecret \
+CALCOM_API_URL=http://127.0.0.1:5510/cal CALCOM_API_KEY=cal_stub \
+CALCOM_EVENT_TYPE_ID=99 \
+PORT=5000 STATIC_DIR="$PWD/artifacts/leadsprint/dist/public" \
+  node artifacts/api-server/dist/index.mjs
+```
+
+`DATABASE_POOL_MAX=1` is required for the embedded dev database, which serves
+one connection at a time. Production should leave it unset (defaults to 10).
+
+`RETELL_API_URL` / `CALCOM_API_URL` exist only so this test can redirect the
+provider calls. **Never set them on a customer deployment** — unset, they
+default to the real provider APIs.
+
+## 2. Helper: sign an intake request
+
+```bash
+intake() {
+  local body="$1"
+  local sig
+  sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac devsecret -hex | sed 's/.*= //')
+  curl -s -X POST localhost:5000/api/webhooks/intake \
+    -H 'content-type: application/json' \
+    -H "x-leadsprint-signature: sha256=$sig" -d "$body"
+}
+```
+
+## 3. The checks
+
+Each check states the request and the response that counts as a pass. All of
+these were executed and passed on branch `arena/01a0a8e1-leadsprint-boomi`.
+
+### 3.1 Setup gate blocks calling until configured
+
+With `RETELL_*` / `CALCOM_*` unset:
+
+```
+GET /api/onboarding/checklist
+-> ready_for_live_calls: false, missing_required: [provider_retell, provider_calcom]
+```
+
+An intake with good consent still records the lead but refuses to dial:
+
+```
+-> {"accepted":true,"consent_status":"valid",
+    "call":{"status":"setup_incomplete",
+            "detail":"Setup incomplete — live calling is disabled until these are
+                      configured: Retell voice provider configured, Cal.com calendar
+                      provider configured."}}
+```
+
+**This is the single most important guarantee in the product: an
+unconfigured deployment cannot call anyone.**
+
+### 3.2 Consent is enforced at the boundary
+
+| Request | Expected |
+| --- | --- |
+| no consent fields | `accepted: true`, `consent_status: "unknown"`, never dialled |
+| `consent_status: "valid"` with no `consent_source` | **400** — `consent_status "valid" requires a non-empty consent_source` |
+| `consent_status: "valid"` + `consent_source: "website enquiry form"` | `accepted: true`, `consent_status: "valid"`, call enqueued |
+
+A caller cannot assert consent without saying where it came from.
+
+### 3.3 Duplicate intake is idempotent
+
+Replaying byte-identical intake:
+
+```
+-> {"accepted":false,"reason":"duplicate"}
+```
+
+One lead, one call job. The lead is not called twice.
+
+### 3.4 Forged intake is rejected
+
+```
+x-leadsprint-signature: sha256=deadbeef
+-> 401 {"error":"Invalid intake signature"}
+```
+
+### 3.5 Quiet hours block the call
+
+Observed live at 02:48 America/New_York:
+
+```
+-> {"call":{"status":"policy_blocked",
+            "detail":"Outside allowed calling hours (21:00–08:00 America/New_York,
+                      recipient local time)."}}
+```
+
+The gate is evaluated in the recipient's local time, immediately before the
+provider request — not only at enqueue time.
+
+### 3.6 The vertical slice actually dials
+
+With providers configured and the calling window open, a single signed intake
+produced this request to Retell with no human involvement:
+
+```json
+{
+  "from_number": "+12125550100",
+  "to_number": "+12125558888",
+  "override_agent_id": "agent_stub",
+  "metadata": {
+    "business_id": "business_demo",
+    "lead_id": "lead_e60f82d6-f0e",
+    "call_id": "call_065500a0-e46",
+    "market": "US"
+  }
+}
+```
+
+Response: `{"call":{"status":"started"}}`.
+
+`metadata` must always carry `business_id`, `lead_id` and `call_id` — the
+Retell callback is only reconcilable because of them.
+
+### 3.7 The provider callback reconciles the call
+
+```
+POST /api/webhooks/retell  (signed: x-retell-signature: v=<ms>,d=<hmac(body+ts)>)
+  event=call_ended, duration_ms=184000, disconnection_reason=agent_hangup
+-> {"accepted":true,"duplicate":false}
+```
+
+The call row becomes `completed | 184 s | agent_hangup` in `GET /api/calls`.
+
+### 3.8 Duplicate and unsigned callbacks
+
+```
+replay same callback -> {"accepted":true,"duplicate":true}   (no second write)
+unsigned callback    -> 401 {"error":"Invalid Retell signature"}
+```
+
+### 3.9 The Twilio status callback cannot cross workspaces
+
+The Twilio status callback must name its workspace — configure the status
+callback URL as
+`POST /api/webhooks/twilio/status?businessId=<business_id>`
+(an internal gateway may instead send a `BusinessId` form field). Verified
+against a real database with two workspaces holding the same CallSid:
+
+```
+callback ?businessId=A, CallSid owned by A -> 202, A's call updated, B's untouched
+callback with no businessId                -> 400, no call touched, no event written
+callback ?businessId=B, CallSid owned by A -> 400, no event written, A's call untouched
+replayed callback                          -> {"accepted":true,"duplicate":true}
+```
+
+LeadSprint never guesses the tenant by looking up `provider_call_id` across
+workspaces, and `calls_provider_call_unique` is scoped by `business_id`, so
+two workspaces can hold the same provider call id without one blocking the
+other.
+
+### 3.10 The console renders every call state
+
+`GET /api/calls` after the above:
+
+```
+completed      | Live Test 2 | 184 s | agent_hangup
+policy_blocked | Live Test   |       | Blocked — quiet_hours
+queued         | Real Lead   |       | Queued for provider
+```
+
+`queued`, `policy_blocked` and `uncertain` are all filterable in the console,
+and `uncertain` / `failed` / `policy_blocked` expose the reconcile-and-retry
+action in the call drawer.
+
+## 4. Regression suite
+
+```bash
+pnpm --filter @workspace/api-server run typecheck   # clean
+pnpm --filter @workspace/api-server run test        # 131 tests
+pnpm --filter @workspace/leadsprint run typecheck   # clean
+pnpm --filter @workspace/leadsprint run test        # 12 tests
+```
+
+Repo-wide `pnpm run typecheck` is green again — the pre-existing
+`artifacts/mockup-sandbox/vite.config.ts` error that used to make CI's
+typecheck gate vacuous was fixed in the Days 1–8 merge, so a green run now
+actually means something. Per-package checks remain the fast inner loop.
+
+## 5. Still open before a live pilot
+
+Closed in Days 9–10:
+
+- ~~The `calls_provider_call_unique` constraint is global rather than scoped
+  by `business_id`, and the Twilio status webhook looks up calls across
+  tenants~~ — the index is now `(business_id, provider, provider_call_id)`
+  and the Twilio callback must name its workspace (§3.9).
+
+Closed in Days 11–12:
+
+- ~~`/usage` hard-codes the period label `"September 2026"`~~ — usage is
+  now one row per business per calendar month with lazy rollover
+  (`lib/usage.ts`); the label comes from the row's own `period_start`,
+  and the Retell/appointment writers attribute to the current month.
+- ~~`/today` hard-codes `unresolved_messages: 1`~~ — now the trailing-7-day
+  count of message-type activities (caller messages and failed-transfer
+  captures awaiting operator follow-up). A true resolve workflow is still
+  future work.
+- ~~`app.use(cors())` is fully open~~ — exact-allowlist via `CORS_ORIGINS`,
+  loopback-only in non-production, no CORS headers at all in production;
+  denied origins get 403 JSON (`middlewares/cors.ts`).
+- ~~No rate limiting on the webhook or cron routes~~ — per-IP ceilings on
+  the webhook (600), agent (300) and cron (60) routers per 15 minutes,
+  env-overridable, in-memory store (`middlewares/rateLimit.ts`).
+  Multi-instance deployments need a shared store before scaling out.
+- ~~The Dockerfile runs as root~~ — the runtime stage runs as the
+  unprivileged `node` user; verified by serving traffic from the
+  production bundle as `nobody`.
+- ~~No backup/restore procedure has been exercised~~ —
+  `scripts/backup/backup.sh` + `restore-verify.sh` round-tripped the
+  production schema with real data on PostgreSQL 16.2 (schema identical,
+  data identical), and CI re-exercises it on every run. Runbook:
+  `docs/backup-restore.md`. Coolify scheduled backups to S3 must still
+  be configured on the production database before onboarding a pilot.
+
+Closed after the audit-fix pass:
+
+- ~~`/reports/weekly` still labels its window `"This week · pilot report"`
+  while counting all-time rows~~ — the report is now a true trailing-7-days
+  window; the label is computed from the window itself, and voice minutes /
+  cost are derived from in-window call durations at `VOICE_COST_PER_MINUTE`
+  (single source of truth shared with the webhook writer).
+
+Still open:
+
+- Coolify scheduled database backups (nightly, S3, 14-day retention) are
+  documented but not yet configured — needs the production database to
+  exist first.
+- Message resolve workflow (see above): `unresolved_messages` ages items
+  out after 7 days rather than tracking real resolution.
